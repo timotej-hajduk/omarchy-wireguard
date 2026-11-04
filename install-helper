@@ -10,9 +10,9 @@
 #   /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root   (0755)
 #   /etc/sudoers.d/omarchy-wireguard                               (0440)
 #
-# Nothing root installs is read back from a path you can write to. The helper's
-# bytes reach root once, over stdin that is opened before sudo runs. Root
-# writes them and the sudoers rule into root-only (0700) staging directories
+# The helper is captured in memory and hashed before sudo asks for approval.
+# Root verifies that exact snapshot, rather than reopening its source. Root
+# writes it and the sudoers rule into root-only (0700) staging directories
 # beside their destinations, checks the staged files (`bash -n`, `visudo -c`),
 # and renames them into place. So another process running as you can't swap
 # either file between the check and the install.
@@ -34,6 +34,15 @@ if [[ ${1:-} == --remove ]]; then
   echo "Removed /etc/sudoers.d/omarchy-wireguard and /usr/local/libexec/omarchy-wireguard."
   exit 0
 fi
+[[ $# -eq 0 ]] || { echo "Usage: install-helper [--remove]" >&2; exit 1; }
+
+source_helper=$here/omarchy-wireguard-root
+[[ -f $source_helper && ! -L $source_helper ]] || { echo "Expected a regular, non-symlink helper." >&2; exit 1; }
+helper_snapshot=$(head -c 262145 -- "$source_helper")
+(( ${#helper_snapshot} < 262144 )) || { echo "Helper exceeds 256 KiB." >&2; exit 1; }
+expected=$(sed -n 's/^VERSION=//p' <<<"$helper_snapshot" | head -n 1)
+[[ $expected =~ ^[0-9]+$ ]] || { echo "Invalid helper version." >&2; exit 1; }
+local_sum=$(printf '%s\n' "$helper_snapshot" | sha256sum | cut -d' ' -f1)
 
 # Runs as root. $1 is the user name; stdin is the helper, read exactly once.
 # Prints "VERSION SHA256" of what it installed.
@@ -43,6 +52,8 @@ umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 user=$1
+expected_sum=$2
+[[ $expected_sum =~ ^[0-9a-f]{64}$ ]] || exit 1
 if [[ ! $user =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || ! id -u -- "$user" >/dev/null 2>&1; then
   echo "unexpected user name" >&2
   exit 1
@@ -52,15 +63,63 @@ dest_dir=/usr/local/libexec/omarchy-wireguard
 dest=$dest_dir/omarchy-wireguard-root
 rule=/etc/sudoers.d/omarchy-wireguard
 
-install -d -o root -g root -m 0755 /usr/local/libexec "$dest_dir"
+trusted_path() {
+  local path=$1 kind=$2 owner mode
+  [[ ! -L $path ]] || { echo "Refusing symlink: $path" >&2; exit 1; }
+  if [[ $kind == directory ]]; then [[ -d $path ]]; else [[ -f $path ]]; fi || exit 1
+  read -r owner mode < <(stat -c "%u %a" -- "$path")
+  [[ $owner == 0 && $mode =~ ^[0-7]{1,4}$ ]] && (( (8#$mode & 0022) == 0 )) || {
+    echo "Refusing non-root-owned or writable path: $path" >&2; exit 1;
+  }
+}
+ensure_directory() {
+  local path=$1 parent
+  if [[ $path != / ]]; then
+    parent=${path%/*}; [[ -n $parent ]] || parent=/
+    ensure_directory "$parent"
+  fi
+  if [[ ! -e $path && ! -L $path ]]; then mkdir -m 0755 -- "$path"; fi
+  trusted_path "$path" directory
+}
+ensure_directory "$dest_dir"
+ensure_directory /etc/sudoers.d
+for existing in "$dest" "$rule" "$dest_dir/.install.lock"; do
+  if [[ -e $existing || -L $existing ]]; then trusted_path "$existing" file; fi
+done
+exec 9>"$dest_dir/.install.lock"
+flock -x 9
 
 # Root-only staging beside each destination, so each final mv is an atomic
 # rename. sudo skips /etc/sudoers.d entries whose names contain a dot.
 helper_stage=$(mktemp -d "$dest_dir/.staging.XXXXXX")
 rule_stage=$(mktemp -d /etc/sudoers.d/.omarchy-wireguard.XXXXXX)
-trap '\''rm -rf -- "$helper_stage" "$rule_stage"'\'' EXIT
+had_helper=0; had_rule=0; replacing=0; committed=0
+if [[ -f $dest ]]; then cp -p -- "$dest" "$helper_stage/previous"; had_helper=1; fi
+if [[ -f $rule ]]; then cp -p -- "$rule" "$rule_stage/previous"; had_rule=1; fi
+cleanup() {
+  local rc=$? restored=1
+  trap - EXIT
+  if (( replacing && ! committed )); then
+    if (( had_helper )); then mv -fT -- "$helper_stage/previous" "$dest" || restored=0
+    else rm -f -- "$dest" || restored=0; fi
+    if (( had_rule )); then mv -fT -- "$rule_stage/previous" "$rule" || restored=0
+    else rm -f -- "$rule" || restored=0; fi
+  fi
+  if (( ! restored )); then
+    echo "Rollback incomplete; preserved staging files in $helper_stage and $rule_stage." >&2
+    exit 1
+  fi
+  rm -rf -- "$helper_stage" "$rule_stage"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap "exit 130" INT
+trap "exit 143" TERM
 
 cat >"$helper_stage/helper"
+[[ $(sha256sum "$helper_stage/helper" | cut -d" " -f1) == "$expected_sum" ]] || {
+  echo "Helper snapshot checksum mismatch." >&2; exit 1;
+}
 if ! head -n 1 "$helper_stage/helper" | grep -qx "#!/bin/bash"; then
   echo "that is not the root helper" >&2
   exit 1
@@ -74,8 +133,9 @@ chmod 0755 "$helper_stage/helper"
 cat >"$rule_stage/rule" <<EOF
 # Installed by the io.github.codemonkey76.wireguard Omarchy widget (install-helper).
 # Lets $user run the widget'\''s root helper, and nothing else, without a password.
-# The widget polls it every few seconds, so successful runs are not logged.
-Defaults!$dest !log_allowed, !pam_session
+# Suppress polling noise only; successful control operations remain auditable.
+Cmnd_Alias OMARCHY_WIREGUARD_READ = $dest status, $dest version
+Defaults!OMARCHY_WIREGUARD_READ !log_allowed, !pam_session
 $user ALL=(root) NOPASSWD: $dest
 EOF
 chown root:root "$rule_stage/rule"
@@ -84,22 +144,22 @@ chmod 0440 "$rule_stage/rule"
 # exact file that is about to be renamed into place.
 visudo -cqf "$rule_stage/rule"
 
-mv -f -- "$helper_stage/helper" "$dest"
-mv -f -- "$rule_stage/rule" "$rule"
+replacing=1
+mv -fT -- "$helper_stage/helper" "$dest"
+mv -fT -- "$rule_stage/rule" "$rule"
+committed=1
 echo "$version $(sha256sum "$dest" | cut -d" " -f1)"
 '
 
-result=$(sudo bash -c "$root_install" install-helper "$user" <"$here/omarchy-wireguard-root") || {
-  echo "Install failed; nothing was changed." >&2
+result=$(printf '%s\n' "$helper_snapshot" | sudo bash -c "$root_install" install-helper "$user" "$local_sum") || {
+  echo "Install failed; see the diagnostic above." >&2
   exit 1
 }
 read -r version sum <<<"$result"
 
 # Confirm the installed helper answers, is the version this plugin ships, and
 # is byte-for-byte the plugin's copy.
-expected=$(sed -n 's/^VERSION=//p' "$here/omarchy-wireguard-root" | head -n 1)
 answer=$(sudo -n "$dest" version 2>/dev/null || true)
-local_sum=$(sha256sum "$here/omarchy-wireguard-root" | cut -d' ' -f1)
 if [[ $answer == "$version" && $version == "$expected" && $sum == "$local_sum" ]]; then
   echo "Installed the root helper (version $version, sha256 ${sum:0:16}…). The widget picks it up within a few seconds."
 else
