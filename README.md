@@ -3,7 +3,7 @@
 An [Omarchy](https://omarchy.org) shell (Quickshell) bar widget for
 **WireGuard** tunnels managed by `wg-quick`.
 
-See whether the tunnel is really passing traffic at a glance, and open a panel
+See tunnel and peer status at a glance, and open a panel
 for live throughput, handshake age, latency, routes and DNS, with a switch to
 connect or disconnect.
 
@@ -28,10 +28,18 @@ connect or disconnect.
 - A tunnel that is down shows its configuration (endpoint, address, routes,
   DNS), so you can see what connecting would do.
 
-"Up" isn't the same as working. An interface can exist while the peer is
-unreachable, so the widget treats a tunnel as connected only when its latest
-handshake is under three minutes old. With `PersistentKeepalive` set, a live
-peer handshakes at least every two minutes.
+An up interface does not establish connectivity. The widget checks the actual
+interface UP flag and evaluates each peer separately. Recent handshakes are
+labelled as recent activity. An old handshake without `PersistentKeepalive`
+is shown as idle, because inactivity alone does not establish failure. An old
+handshake with keepalive configured produces a warning; its threshold is the
+greater of three minutes and twice the keepalive interval plus two minutes.
+A recent handshake from one peer cannot hide a warning from another. Latency
+probes and traffic provide additional evidence, not a guarantee of connectivity.
+
+This fork retains the original widget's controls and monitoring features and
+hardens its privileged helper, installer, state files and network probes.
+The original plugin is by [Shane Poppleton](https://github.com/codemonkey76/omarchy-wireguard).
 
 ## Requirements
 
@@ -39,22 +47,25 @@ peer handshakes at least every two minutes.
   older Waybar bar.
 - `wireguard-tools` (`wg`, `wg-quick`), with tunnels defined as `wg-quick`
   configs in `/etc/wireguard/<name>.conf`.
-- `jq`, `ping`, `notify-send` and `wl-copy`, all preinstalled on Omarchy.
-- systemd-resolved for the DNS row (optional).
+- `jq`, Python 3 (standard library only), `ping`, `notify-send`, `wl-copy`,
+  GNU coreutils and util-linux (`flock`). Python runs only as your user; it
+  handles private state files, notification deduplication and network probes.
+- systemd-resolved for the DNS row (optional) and for hostname probe targets.
+  Hostname probes require DNS configured on the selected WireGuard link.
 - The bundled root helper, installed once with `install-helper` (below), for
   configs, peers, handshakes and the switches.
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/codemonkey76/omarchy-wireguard --enable
+omarchy plugin add https://github.com/timotej-hajduk/omarchy-wireguard --enable
 ~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper
 ```
 
 Or by hand:
 
 ```bash
-git clone https://github.com/codemonkey76/omarchy-wireguard \
+git clone https://github.com/timotej-hajduk/omarchy-wireguard \
   ~/.config/omarchy/plugins/io.github.codemonkey76.wireguard
 omarchy plugin enable io.github.codemonkey76.wireguard
 ~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper
@@ -66,6 +77,9 @@ Either way the widget lands in the bar's right section: `--enable` and
 
 `install-helper` asks for your sudo password once. Re-run it after updating
 the plugin if the panel says the helper is out of date.
+This version requires helper protocol **3**; controls refuse older copies.
+Review and publish local changes to your fork before installing by its URL.
+Editing this checkout does not install or upload anything by itself.
 
 ## The root helper
 
@@ -81,15 +95,19 @@ you, run that one script without a password:
 ```
 
 ```
-Defaults!/usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root !log_allowed, !pam_session
+Cmnd_Alias OMARCHY_WIREGUARD_READ = /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root status, /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root version
+Defaults!OMARCHY_WIREGUARD_READ !log_allowed, !pam_session
 you ALL=(root) NOPASSWD: /usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root
 ```
 
-`install-helper` never has root re-read a file you can write to. It hands the
-helper to root once, over stdin that is opened before `sudo` runs. Root stages
-the helper and the rule in root-only directories beside their destinations,
-checks the staged copies (`bash -n`, `visudo -c`), and renames them into
-place. It then confirms the installed helper is byte-for-byte the plugin's copy.
+`install-helper` captures the helper in memory and hashes it before invoking
+sudo. Root verifies that snapshot against the hash instead of reopening the
+checkout. The installer rejects symlinks and non-root-owned or group/other
+writable destination paths, serializes concurrent installs with a lock, stages
+both files in root-only directories, checks their syntax (`bash -n`, `visudo -c`),
+and renames them into place. It restores previous copies if replacement fails,
+then verifies the installed version and checksum on success. This protects
+the installation handoff; it does not establish that the source is trustworthy.
 
 The helper does six things and nothing else:
 
@@ -106,13 +124,19 @@ The helper does six things and nothing else:
 never a path. That matters because `wg-quick` runs a config's
 `PostUp`/`PostDown` hooks as root: a passwordless rule for `wg-quick` itself
 would let anything running as you run any command as root, by pointing it at a
-config of its own. The helper only ever acts on root-owned configs in
-`/etc/wireguard`. The installed copy is root-owned too, so updating the plugin
+config of its own. The helper checks that `/etc/wireguard`, its ancestors and
+the selected config are root-owned, have no group/other write permission and
+are not symlinks. Configs must be regular files with no group/other permissions,
+so private keys are not exposed through readable configs. A violation fails closed,
+including during status collection. Recommended permissions are `root:root 0700`
+for `/etc/wireguard` and `root:root 0600` for each config; the installer does not
+change existing VPN configs or their permissions. Read permission for other
+users is not needed by the widget. The installed helper is root-owned too, so updating the plugin
 can't change what runs as root until you re-run `install-helper`.
 
-The widget polls every few seconds, so the rule turns off sudo's log lines for
-this one command (`!log_allowed, !pam_session`). Without that, every poll
-would add several lines to the journal.
+The rule suppresses successful sudo logging and PAM sessions for the read-only
+`status` and `version` calls. Control operations retain the system's normal
+sudo logging, making tunnel and boot-setting changes auditable.
 
 Private and preshared keys never leave the root helper. Configs are read
 through a whitelist of non-secret keys (`Address`, `DNS`, `MTU`, `ListenPort`,
@@ -122,6 +146,14 @@ column.
 
 Without the root helper the widget still shows which interfaces are up, their
 addresses, traffic and DNS, and the panel says what's missing and how to fix it.
+If an installed helper fails or has the wrong version, the bar shows unavailable
+status and disables controls instead of presenting incomplete readings as healthy.
+
+The sudo rule deliberately permits your user to control existing, trusted VPN
+configs without a password. Legitimate `wg-quick` hooks still execute as root.
+An application already running as your user can invoke the same permitted
+operations. These changes do not sandbox Quickshell plugins or protect against
+malicious root-controlled hooks, a compromised account or dependencies.
 
 ## Settings
 
@@ -143,6 +175,12 @@ Set these on the widget's entry in `~/.config/omarchy/shell.json`:
 | `notify` | `true` | Desktop notifications when a tunnel drops, stops handshaking, or recovers. |
 | `labels` | `{}` | Friendly names per interface, shown instead of `wg0`. |
 | `probe` | `{}` | Host to ping for latency, per interface. Defaults to the tunnel's DNS server; `""` turns probing off for that tunnel. |
+
+Probes use `ping -I <interface>` with numeric addresses. Hostname targets are
+resolved explicitly through that WireGuard link using `resolvectl`, with its
+cache disabled and no fallback to the default resolver. If scoped resolution
+or interface-bound ping is unavailable, the panel reports a probe error.
+No probe runs while the selected tunnel is down or its status is unavailable.
 
 ## Using it
 
@@ -179,8 +217,11 @@ The bundled `omarchy-wireguard` script works on its own too:
 omarchy-wireguard json            # every tunnel's state, as JSON
 omarchy-wireguard up wg0          # also: down, restart
 omarchy-wireguard enable wg0      # start at boot; disable to stop
-omarchy-wireguard probe 10.8.0.1  # round-trip time in ms
+omarchy-wireguard probe 10.8.0.1 wg0  # interface-bound round-trip time in ms
 ```
+
+The earlier `probe HOST` form still works when exactly one WireGuard interface
+is up. With several tunnels, provide the interface explicitly.
 
 ## How it works
 
@@ -197,6 +238,23 @@ Rates come from the difference between two polls. Connecting and disconnecting
 go through the root helper's `up` and `down`, and the boot switch through its
 `enable` and `disable`.
 
+Failed, malformed, timed-out or expired status collection changes the bar to
+an unavailable state. A separate clock ages handshakes even when polling fails.
+Rates and graph history reset when an interface is recreated, counters reset
+or readings have a long gap. Disappearing interfaces trigger disconnect
+notifications, including when running without the root helper.
+
+State markers and notification locks use an owned, private directory under
+`$XDG_RUNTIME_DIR` (or `~/.cache` when unset). Symlinks, hardlinked markers,
+unsafe ownership and writable paths are rejected. Notification arguments are
+passed without a shell and their markup is escaped. Demo mode remains available
+through the `demo` marker in that directory and is visibly labelled as simulated.
+
+External commands have deadlines and captured output limits. Tunnel operations
+have a two-minute limit, boot-setting changes thirty seconds, and panel status
+collection fifteen seconds. A timeout can leave a partially completed operation;
+the widget reports an error and refreshes the observed state.
+
 `DNS =` in a config works only when `resolvconf` is installed. On a
 systemd-resolved host the usual workaround is
 `PostUp = resolvectl dns %i <server>`, and the root helper reads that form too.
@@ -206,6 +264,20 @@ an error. Use `PreDown` instead, or leave it out: systemd-resolved drops a
 deleted link's DNS on its own. The widget copes either way. When the tunnel
 ends up where you asked but a hook complained, it reports success and shows
 the complaint as a note.
+
+## Development checks
+
+```bash
+bash -n install-helper omarchy-wireguard omarchy-wireguard-root
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+node tests/model-test.cjs
+git diff --check
+```
+
+The tests use temporary files and mocked privileged commands, ownership metadata
+and probes. They do not run sudo, change live tunnels or send network packets.
+Node is only needed for the tests. Qt 6 `qmllint` can additionally validate
+`Panel.qml` and `Model.js` when the installed Omarchy QML imports are available.
 
 ## Remove
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.codemonkey76.wireguard",
   "name": "WireGuard",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Shane Poppleton",
   "description": "WireGuard tunnel status, live traffic, latency and connect/disconnect",
   "kinds": [
