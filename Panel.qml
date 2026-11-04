@@ -253,7 +253,7 @@ Panel {
   function probe() {
     if (probeProc.running || !selectedUp || selectedProbeHost === "") return
     probeProc.tunnelName = selected.name
-    probeProc.command = ["bash", wg.cli, "probe", selectedProbeHost]
+    probeProc.command = ["bash", wg.cli, "probe", selectedProbeHost, selected.name]
     probeProc.running = true
   }
 

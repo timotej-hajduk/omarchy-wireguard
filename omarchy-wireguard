@@ -4,7 +4,7 @@
 #   omarchy-wireguard [json]                     every tunnel's state, as JSON
 #   omarchy-wireguard up|down|restart NAME       drive a wg-quick tunnel
 #   omarchy-wireguard enable|disable NAME        start it at boot, or stop doing so
-#   omarchy-wireguard probe HOST                 round-trip time to HOST (JSON)
+#   omarchy-wireguard probe HOST [NAME]          interface-bound latency (JSON)
 #   omarchy-wireguard notify NAME STATE SUMMARY [BODY]
 #                                                desktop notification, sent once
 #                                                per tunnel+state within 30s
@@ -16,9 +16,11 @@
 # not configs, peers, handshakes or the switches.
 
 set -uo pipefail
+export LC_ALL=C
 
 ROOT_HELPER=/usr/local/libexec/omarchy-wireguard/omarchy-wireguard-root
 BUNDLED_ROOT_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/omarchy-wireguard-root"
+RUNTIME="${BUNDLED_ROOT_HELPER%/*}/runtime.py"
 
 # Shared between every copy of the widget (there is one per monitor): when a
 # tunnel was last driven from here, and which notifications went out recently.
@@ -27,6 +29,17 @@ STATE_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/omarchy-wireguard"
 die() { jq -cn --arg e "$*" '{ok: false, error: $e}'; exit 1; }
 
 valid_name() { [[ $1 =~ ^[A-Za-z0-9_=+][A-Za-z0-9_=+.-]{0,14}$ ]]; }
+
+# Bound both the producer's lifetime and the amount retained by QML/Bash.
+capture() {
+  local seconds=$1 output rc; shift
+  output=$(timeout -k 2 "$seconds" "$@" 2>&1 | head -c 131073); rc=$?
+  (( ${#output} <= 131072 )) || return 125
+  (( rc == 0 )) || { printf '%s' "$output"; return "$rc"; }
+  printf '%s' "$output"
+}
+
+state() { python3 "$RUNTIME" "$@"; }
 
 in_list() {  # in_list NEEDLE ITEMS...
   local needle=$1; shift
@@ -37,34 +50,50 @@ in_list() {  # in_list NEEDLE ITEMS...
 
 # Demo mode, for screenshots: `touch "$XDG_RUNTIME_DIR/omarchy-wireguard/demo"`
 # and the widget shows made-up tunnels instead of yours. Remove it to go back.
-demo() { [[ -f $STATE_DIR/demo ]]; }
+demo() {
+  local flag
+  flag=$(state demo) || die "unsafe or unavailable runtime state: $flag"
+  [[ $flag == true ]]
+}
 
 expected_version() { sed -n 's/^VERSION=//p' "$BUNDLED_ROOT_HELPER" 2>/dev/null | head -n 1; }
 
 # iproute2 7.2 emits an empty {} for every link the type filter skips, so
 # drop entries without a name rather than reading them as "null".
-live_names() { ip -j link show type wireguard 2>/dev/null | jq -r '.[] | .ifname // empty'; }
+live_links() {
+  local links
+  links=$(capture 3 ip -j link show type wireguard) || return 1
+  jq -ce 'if type == "array" then map(select(.ifname != null)) else error("invalid links") end' <<<"$links"
+}
 
 # resolvectl prints "Link 70 (wg0): 10.8.0.53 10.8.0.54" -> ["10.8.0.53","10.8.0.54"]
 resolved_list() {
-  resolvectl "$1" "$2" 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' |
+  local output
+  output=$(capture 2 resolvectl "$1" "$2") || { printf '[]'; return; }
+  printf '%s' "$output" | sed 's/^[^:]*:[[:space:]]*//' |
     jq -Rsc 'split("\n") | map(split(" ")) | add // [] | map(select(. != ""))'
 }
 
 # What anyone can see about a live interface, plus the port and peers the root
 # helper reported for it (null without the helper).
 live_json() {  # live_json NAME PRIV_LIVE_ENTRY
-  local name=$1 priv=$2 rx tx addrs mtu dns domains
-  rx=$(cat "/sys/class/net/$name/statistics/rx_bytes" 2>/dev/null); [[ $rx =~ ^[0-9]+$ ]] || rx=0
-  tx=$(cat "/sys/class/net/$name/statistics/tx_bytes" 2>/dev/null); [[ $tx =~ ^[0-9]+$ ]] || tx=0
-  addrs=$(ip -j addr show dev "$name" 2>/dev/null | jq -c '[.[0].addr_info[]? | "\(.local)/\(.prefixlen)"]')
-  mtu=$(ip -j link show dev "$name" 2>/dev/null | jq '.[0].mtu // null')
+  local name=$1 priv=$2 rx tx addrs mtu dns domains link up ifindex
+  valid_name "$name" || return 1
+  rx=$(cat "/sys/class/net/$name/statistics/rx_bytes" 2>/dev/null); [[ $rx =~ ^[0-9]+$ ]] || return 1
+  tx=$(cat "/sys/class/net/$name/statistics/tx_bytes" 2>/dev/null); [[ $tx =~ ^[0-9]+$ ]] || return 1
+  addrs=$(capture 3 ip -j addr show dev "$name") || return 1
+  addrs=$(jq -ce 'if length == 1 then [.[0].addr_info[]? | "\(.local)/\(.prefixlen)"] else error("missing interface") end' <<<"$addrs") || return 1
+  link=$(capture 3 ip -j link show dev "$name") || return 1
+  jq -e 'length == 1 and (.[0].flags | type) == "array" and (.[0].ifindex | type) == "number"' <<<"$link" >/dev/null || return 1
+  mtu=$(jq '.[0].mtu // null' <<<"$link")
+  ifindex=$(jq '.[0].ifindex' <<<"$link")
+  up=$(jq '.[0].flags | index("UP") != null' <<<"$link")
   dns=$(resolved_list dns "$name")
   domains=$(resolved_list domain "$name")
   jq -cn --argjson rx "$rx" --argjson tx "$tx" --argjson addrs "${addrs:-[]}" \
     --argjson mtu "${mtu:-null}" --argjson dns "${dns:-[]}" --argjson domains "${domains:-[]}" \
-    --argjson priv "${priv:-null}" '
-    {rx: $rx, tx: $tx, addresses: $addrs, mtu: $mtu, dns: $dns, domains: $domains,
+    --argjson priv "${priv:-null}" --argjson up "$up" --argjson ifindex "$ifindex" '
+    {up: $up, ifindex: $ifindex, rx: $rx, tx: $tx, addresses: $addrs, mtu: $mtu, dns: $dns, domains: $domains,
      listenPort: ($priv.listenPort // null),
      peers: (if $priv == null then null else $priv.peers end)}'
 }
@@ -72,26 +101,30 @@ live_json() {  # live_json NAME PRIV_LIVE_ENTRY
 status_json() {
   demo && { demo_json; return; }
 
-  local priv root=false installed=false confs lives name conf live driven objs=()
+  local priv root=false installed=false confs lives name conf live driven links helper_error="" objs=()
   [[ -x $ROOT_HELPER ]] && installed=true
-  if priv=$(sudo -n "$ROOT_HELPER" status 2>/dev/null) && jq -e '.version' <<<"$priv" >/dev/null 2>&1; then
+  if priv=$(capture 12 sudo -n "$ROOT_HELPER" status) && jq -e '.version and (.configs | type == "object") and (.live | type == "object")' <<<"$priv" >/dev/null 2>&1; then
     root=true
   else
+    if $installed; then helper_error=$(printf '%s' "$priv" | tail -n 1 | head -c 300); fi
     priv='{"version": null, "configs": {}, "live": {}}'
   fi
 
+  links=$(live_links) || die "could not read WireGuard interface inventory"
   mapfile -t confs < <(jq -r '.configs | keys[]' <<<"$priv")
-  mapfile -t lives < <(live_names; jq -r '.live | keys[]' <<<"$priv")
+  mapfile -t lives < <(jq -r '.[].ifname' <<<"$links")
 
   while read -r name; do
     [[ -n $name ]] && valid_name "$name" || continue
     conf=$(jq -c --arg n "$name" '.configs[$n] // null' <<<"$priv")
     live=null
-    in_list "$name" "${lives[@]}" && live=$(live_json "$name" "$(jq -c --arg n "$name" '.live[$n] // null' <<<"$priv")")
-    driven=$(stat -c %Y "$STATE_DIR/$name.driven" 2>/dev/null) || driven=null
+    if in_list "$name" "${lives[@]}"; then
+      live=$(live_json "$name" "$(jq -c --arg n "$name" '.live[$n] // null' <<<"$priv")") || die "could not read interface $name"
+    fi
+    driven=$(state driven "$name") || die "unsafe runtime marker for $name"
     objs+=("$(jq -cn --arg name "$name" --argjson conf "${conf:-null}" --argjson live "${live:-null}" \
       --argjson driven "$driven" '
-      {name: $name, configured: ($conf != null), up: ($live != null), drivenAt: $driven, config: $conf}
+      {name: $name, configured: ($conf != null), up: ($live.up // false), drivenAt: $driven, config: $conf}
       + ($live // {rx: 0, tx: 0, addresses: [], mtu: null, dns: [], domains: [], listenPort: null, peers: null})
       # The kernel only knows the resolved endpoint IP; carry the configured
       # hostname across so the panel can show vpn.example.com rather than an IP.
@@ -101,11 +134,12 @@ status_json() {
         else . end')")
   done < <(printf '%s\n' "${confs[@]}" "${lives[@]}" | sort -u)
 
-  printf '%s\n' "${objs[@]}" | grep -v '^$' |
+  printf '%s\n' "${objs[@]}" |
     jq -cs --argjson now "$(date +%s)" --argjson root "$root" --argjson installed "$installed" \
-      --arg version "$(jq -r '.version // empty' <<<"$priv")" --arg expected "$(expected_version)" '
-      {now: $now, privileged: $root,
+      --arg version "$(jq -r '.version // empty' <<<"$priv")" --arg expected "$(expected_version)" --arg helperError "$helper_error" '
+      {ok: true, demo: false, now: $now, privileged: $root,
        helper: {installed: $installed,
+                error: $helperError,
                 version: (if $version == "" then null else $version end),
                 expected: (if $expected == "" then null else $expected end)},
        tunnels: .}'
@@ -128,7 +162,7 @@ demo_json() {
     ["10.8.0.0/24", "192.168.50.0/24", "172.20.0.0/16"] as $officeRoutes
     | "Hq8vN3kR2mXw7LpT9sYc4bJ6fA1dG5eZ0uV8iO3nQ2c=" as $officeKey
     | "pX5wM2qL8rT1yK7vB4nC9dF6gH3jS0aE2uI5oZ8lW4k=" as $homeKey
-    | {now: $now, privileged: true,
+    | {ok: true, demo: true, now: $now, privileged: true,
        helper: {installed: true, version: "demo", expected: "demo"},
        tunnels: [
          {name: "office", configured: true, up: true, drivenAt: null,
@@ -146,26 +180,41 @@ demo_json() {
 }
 
 # Marks the tunnel as changed on purpose, so no widget copy announces it.
-mark_driven() { mkdir -p -m 700 "$STATE_DIR" && touch "$STATE_DIR/$1.driven"; }
+mark_driven() { state mark "$1" >/dev/null || die "unsafe runtime state; refusing action"; }
+
+require_helper() {
+  local have
+  have=$(capture 3 sudo -n "$ROOT_HELPER" version) || die "the root helper isn't available; run install-helper"
+  [[ $have == "$(expected_version)" ]] || die "the root helper is out of date; run install-helper"
+}
 
 drive() {  # drive up|down|restart NAME
-  local verb=$1 name=${2:-} log rc reached=false complaint
+  local verb=$1 name=${2:-} log rc reached=false complaint observed
   demo && die "demo mode is on (remove $STATE_DIR/demo)"
   valid_name "$name" || die "invalid tunnel name: '$name'"
-  sudo -n "$ROOT_HELPER" version >/dev/null 2>&1 || die "the root helper isn't installed; run install-helper"
+  require_helper
 
   mark_driven "$name"
   case $verb in
-    up|down) log=$(sudo -n "$ROOT_HELPER" "$verb" "$name" 2>&1); rc=$? ;;
-    restart) log=$(sudo -n "$ROOT_HELPER" down "$name" 2>&1; sudo -n "$ROOT_HELPER" up "$name" 2>&1); rc=$? ;;
+    up|down) log=$(capture 125 sudo -n "$ROOT_HELPER" "$verb" "$name"); rc=$? ;;
+    restart)
+      log=$(capture 125 sudo -n "$ROOT_HELPER" down "$name"); rc=$?
+      [[ $log == omarchy-wireguard-root:* ]] && die "$log"
+      (( rc != 124 && rc != 125 && rc != 137 && rc != 141 )) || die "restart interrupted; inspect tunnel state"
+      local remaining
+      remaining=$(live_links) || die "could not verify tunnel stopped"
+      jq -e --arg n "$name" 'any(.[]; .ifname == $n)' <<<"$remaining" >/dev/null && die "tunnel did not stop; restart aborted"
+      log=$(capture 125 sudo -n "$ROOT_HELPER" up "$name"); rc=$?
+      ;;
   esac
   # Again on completion: the quiet window runs from when the change landed,
   # not from when it was asked for.
   mark_driven "$name"
+  (( rc != 124 && rc != 125 && rc != 137 && rc != 141 )) || die "operation interrupted; inspect tunnel state"
 
   # wg-quick echoes every step as "[#] ..." on stderr; the useful line is the
   # last one that is not a trace.
-  complaint=$(grep -v '^\[#\]' <<<"$log" | tail -n 1)
+  complaint=$(grep -v '^\[#\]' <<<"$log" | tail -n 1 | head -c 512)
 
   # The root helper refusing the request (bad name, no such config) is always
   # a failure, whatever state the interface happens to be in.
@@ -176,10 +225,12 @@ drive() {  # drive up|down|restart NAME
   # interface is already deleted. Judge by the end state and pass the
   # complaint on as a warning. (A failed PostUp makes wg-quick tear the
   # interface down again, so that still reads as a failure.)
-  case $verb in
-    down) ip link show dev "$name" >/dev/null 2>&1 || reached=true ;;
-    *)    ip link show dev "$name" >/dev/null 2>&1 && reached=true ;;
-  esac
+  observed=$(live_links) || die "could not verify the final tunnel state"
+  if [[ $verb == down ]]; then
+    jq -e --arg n "$name" 'any(.[]; .ifname == $n)' <<<"$observed" >/dev/null || reached=true
+  else
+    jq -e --arg n "$name" 'any(.[]; .ifname == $n and (.flags | index("UP") != null))' <<<"$observed" >/dev/null && reached=true
+  fi
 
   if ((rc == 0)); then jq -cn '{ok: true}'
   elif $reached; then jq -cn --arg w "$complaint" '{ok: true, warning: $w}'
@@ -192,20 +243,24 @@ set_autostart() {  # set_autostart enable|disable NAME
   local verb=$1 name=${2:-} have log
   demo && die "demo mode is on (remove $STATE_DIR/demo)"
   valid_name "$name" || die "invalid tunnel name: '$name'"
-  have=$(sudo -n "$ROOT_HELPER" version 2>/dev/null) || die "the root helper isn't installed; run install-helper"
-  [[ $have == "$(expected_version)" ]] || die "the root helper is out of date; run install-helper"
+  require_helper
 
-  if log=$(sudo -n "$ROOT_HELPER" "$verb" "$name" 2>&1); then jq -cn '{ok: true}'
+  if log=$(capture 35 sudo -n "$ROOT_HELPER" "$verb" "$name"); then jq -cn '{ok: true}'
   else die "$(tail -n 1 <<<"$log" | sed 's/^omarchy-wireguard-root: //')"; fi
 }
 
 probe() {
-  local host=${1:-} ms
+  local host=${1:-} interface=${2:-} ms links
   [[ $host =~ ^[A-Za-z0-9.:-]{1,253}$ ]] || die "invalid host: '$host'"
   if demo; then
     ms=$((12 + $(date +%s) % 7))
   else
-    ms=$(ping -n -c 1 -W 1 "$host" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n 1)
+    if [[ -z $interface ]]; then
+      links=$(live_links) || die "could not read WireGuard interfaces"
+      interface=$(jq -er '[.[] | select(.flags | index("UP") != null)] | if length == 1 then .[0].ifname else error("specify a tunnel") end' <<<"$links") || die "specify an interface when zero or several tunnels are up"
+    fi
+    valid_name "$interface" || die "invalid interface name"
+    exec timeout -k 1 15 python3 "$RUNTIME" probe "$interface" "$host"
   fi
   jq -cn --arg host "$host" --arg ms "$ms" \
     '{host: $host, ms: (if $ms == "" then null else ($ms | tonumber) end)}'
@@ -219,24 +274,14 @@ notify_once() {  # notify_once NAME STATE SUMMARY [BODY]
   valid_name "$name" || die "invalid tunnel name: '$name'"
   [[ $state =~ ^[a-z]{1,20}$ ]] || die "invalid state: '$state'"
   demo && return 0
-  mkdir -p -m 700 "$STATE_DIR"
-  (
-    flock -w 2 9 || exit 0
-    local marker="$STATE_DIR/$name.$state.notified" age
-    if [[ -f $marker ]]; then
-      age=$(( $(date +%s) - $(stat -c %Y "$marker") ))
-      ((age < 30)) && exit 0
-    fi
-    touch "$marker"
-    notify-send -a WireGuard "$summary" "$body"
-  ) 9>"$STATE_DIR/$name.lock"
+  state notify "$name" "$state" "$summary" "$body"
 }
 
 case ${1:-json} in
   json) status_json ;;
   up|down|restart) drive "$1" "${2:-}" ;;
   enable|disable) set_autostart "$1" "${2:-}" ;;
-  probe) probe "${2:-}" ;;
+  probe) probe "${2:-}" "${3:-}" ;;
   notify) shift; notify_once "$@" ;;
-  *) echo "usage: omarchy-wireguard [json | up|down|restart NAME | enable|disable NAME | probe HOST | notify NAME STATE SUMMARY [BODY]]" >&2; exit 2 ;;
+  *) echo "usage: omarchy-wireguard [json | up|down|restart NAME | enable|disable NAME | probe HOST [NAME] | notify NAME STATE SUMMARY [BODY]]" >&2; exit 2 ;;
 esac
