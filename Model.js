@@ -1,8 +1,7 @@
 .pragma library
 
-// A tunnel with PersistentKeepalive 25 re-handshakes at least every ~2 min
-// (REKEY_AFTER_TIME 120s). Past 180s without one, the peer is gone even
-// though the interface still looks up.
+// Inactivity alone does not establish peer failure. Warn about old handshakes
+// only when keepalives are expected, and describe every peer independently.
 var STALE_AFTER = 180
 
 var ICON_CONNECTED = "󰦝"   // md-shield_lock
@@ -33,7 +32,13 @@ function isList(value) {
 function parse(text) {
   try {
     var parsed = JSON.parse(String(text || "").trim())
-    if (!parsed || !isList(parsed.tunnels)) return null
+    if (!parsed || parsed.ok !== true || !isList(parsed.tunnels) || !Number.isFinite(parsed.now)) return null
+    for (var i = 0; i < parsed.tunnels.length; i++) {
+      var tunnel = parsed.tunnels[i]
+      if (!tunnel || !/^[A-Za-z0-9_=+][A-Za-z0-9_=+.-]{0,14}$/.test(tunnel.name)
+          || typeof tunnel.up !== "boolean" || !Number.isFinite(tunnel.rx) || tunnel.rx < 0
+          || !Number.isFinite(tunnel.tx) || tunnel.tx < 0) return null
+    }
     return parsed
   } catch (e) {
     return null
@@ -49,24 +54,50 @@ function lastHandshake(tunnel) {
 
 // "down" · "connecting" (up, never handshaked) · "stale" · "connected" ·
 // "up" (interface up but peers unreadable without root)
+function peerState(peer, now) {
+  var handshake = Number(peer.handshake || 0)
+  if (handshake <= 0) return "connecting"
+  var age = now - handshake
+  if (age < 0) return "unknown"
+  if (age <= STALE_AFTER) return "connected"
+  var keepalive = Number(peer.keepalive || 0)
+  return keepalive > 0 && age > Math.max(STALE_AFTER, keepalive * 2 + 120) ? "stale" : "idle"
+}
+
+function fresh(loaded, failed, lastSuccess, now, interval) {
+  var age = now - lastSuccess
+  return loaded && !failed && age >= 0 && age <= Math.max(15, interval * 3)
+}
+
 function state(tunnel, now) {
   if (!tunnel || !tunnel.up) return "down"
   if (!isList(tunnel.peers)) return "up"
-  var hs = lastHandshake(tunnel)
-  if (hs === 0) return "connecting"
-  return now - hs <= STALE_AFTER ? "connected" : "stale"
+  if (!tunnel.peers.length) return "connecting"
+  var recent = 0, waiting = false
+  for (var i = 0; i < tunnel.peers.length; i++) {
+    var value = peerState(tunnel.peers[i], now)
+    if (value === "stale" || value === "unknown") return value
+    if (value === "connected") recent++
+    if (value === "connecting") waiting = true
+  }
+  if (recent === tunnel.peers.length) return "connected"
+  if (recent > 0) return "partial"
+  return waiting ? "connecting" : "idle"
 }
 
 function icon(st) {
-  if (st === "connected" || st === "up") return ICON_CONNECTED
-  if (st === "stale" || st === "connecting") return ICON_STALE
+  if (["connected", "up", "idle", "partial"].indexOf(st) >= 0) return ICON_CONNECTED
+  if (st === "stale" || st === "connecting" || st === "unknown") return ICON_STALE
   return ICON_DOWN
 }
 
 function stateLabel(st) {
   return {
-    connected: "Connected",
-    up: "Up",
+    connected: "Recent peer handshakes",
+    up: "Interface up · peers unavailable",
+    partial: "Some peers recently active",
+    idle: "Interface up · no recent handshake",
+    unknown: "Status unavailable",
     connecting: "Waiting for handshake",
     stale: "No recent handshake",
     down: "Disconnected"
@@ -77,11 +108,11 @@ function stateLabel(st) {
 // warning if one is up but not passing traffic, off when none is up.
 function overall(tunnels, now) {
   var best = "none"
-  var rank = { none: 0, down: 1, stale: 2, connecting: 2, up: 3, connected: 4 }
+  var rank = { none: 0, down: 1, stale: 2, connecting: 2, idle: 3, partial: 3, up: 3, connected: 4 }
   for (var i = 0; i < (tunnels || []).length; i++) {
     var st = state(tunnels[i], now)
     // A stale tunnel outranks a connected one: something needs attention.
-    if (st === "stale" || st === "connecting") return st
+    if (st === "stale" || st === "connecting" || st === "unknown") return st
     if (rank[st] > rank[best]) best = st
   }
   return best
@@ -119,7 +150,7 @@ function handshakeText(tunnel, now) {
 
 function label(tunnel, labels) {
   if (!tunnel) return ""
-  var custom = labels && typeof labels === "object" ? labels[tunnel.name] : ""
+  var custom = labels && typeof labels === "object" && Object.prototype.hasOwnProperty.call(labels, tunnel.name) ? labels[tunnel.name] : ""
   return custom ? String(custom) : tunnel.name
 }
 
@@ -176,7 +207,7 @@ function dnsServers(tunnel) {
 // An empty string in settings.probe turns probing off for that tunnel.
 function probeHost(tunnel, probeSettings) {
   if (!tunnel) return ""
-  if (probeSettings && typeof probeSettings === "object" && probeSettings[tunnel.name] !== undefined)
+  if (probeSettings && typeof probeSettings === "object" && Object.prototype.hasOwnProperty.call(probeSettings, tunnel.name))
     return String(probeSettings[tunnel.name] || "")
   var dns = dnsServers(tunnel)
   return dns.length ? String(dns[0]) : ""
@@ -184,7 +215,8 @@ function probeHost(tunnel, probeSettings) {
 
 // Without the root helper an empty list means "nothing is up", not "nothing is
 // configured": /etc/wireguard is unreadable, so a config down there is invisible.
-function tooltip(tunnels, now, labels, rates, privileged) {
+function tooltip(tunnels, now, labels, rates, privileged, available, demo) {
+  if (available === false) return "WireGuard — status unavailable; readings are stale or incomplete"
   if (!tunnels || tunnels.length === 0)
     return privileged === false ? "WireGuard — no tunnel up; configs need the root helper"
                                 : "WireGuard — no tunnels configured"
@@ -198,9 +230,12 @@ function tooltip(tunnels, now, labels, rates, privileged) {
       if (addr) line += "  ·  " + addr
       var r = rates ? rates[t.name] : null
       if (r) line += "\n  " + ICON_RX + " " + rate(r.rx) + "   " + ICON_TX + " " + rate(r.tx)
-      if (isList(t.peers)) line += "\n  handshake " + handshakeText(t, now)
+      if (isList(t.peers)) {
+        for (var p = 0; p < t.peers.length; p++)
+          line += "\n  " + shortKey(t.peers[p].publicKey || "peer") + ": " + stateLabel(peerState(t.peers[p], now))
+      }
     }
     lines.push(line)
   }
-  return lines.join("\n")
+  return (demo ? "DEMO — simulated tunnel data\n" : "") + lines.join("\n")
 }

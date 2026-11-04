@@ -17,23 +17,28 @@ Panel {
   // relative to this file so the plugin is self-contained (`omarchy plugin add`
   // clones QML, not anything on PATH) and invoked via bash so it works whether
   // or not the exec bit survived the clone.
-  readonly property string cli: String(Qt.resolvedUrl("omarchy-wireguard")).replace(/^file:\/\//, "")
-  readonly property int refreshSeconds: Math.max(2, parseInt(setting("refreshSeconds", 5), 10) || 5)
+  readonly property string cli: decodeURIComponent(String(Qt.resolvedUrl("omarchy-wireguard")).replace(/^file:\/\//, ""))
+  readonly property int refreshSeconds: Math.max(2, Math.min(300, parseInt(setting("refreshSeconds", 5), 10) || 5))
   readonly property bool notifyChanges: setting("notify", true) !== false
   readonly property var labels: setting("labels", ({}))
   readonly property var probeSettings: setting("probe", ({}))
   readonly property int historyLength: 60
 
   // ---- State --------------------------------------------------------------
-  // The last good reading is kept across failed polls, so a hiccup leaves the
-  // last known state on the bar instead of blanking it.
+  // Keep the last reading for context, but show unavailable status whenever
+  // collection fails or the reading expires.
   property var status: null
   property bool everLoaded: false
   property bool failed: false
   readonly property var tunnels: status ? status.tunnels : []
-  readonly property int now: status ? status.now : 0
+  property double now: Date.now() / 1000
+  property double lastSuccess: 0
+  readonly property bool statusFresh: Model.fresh(everLoaded, failed, lastSuccess, now, refreshSeconds)
   readonly property bool privileged: status ? status.privileged === true : false
   readonly property var helper: status && status.helper ? status.helper : null
+  readonly property bool helperReady: privileged && helper && helper.version === helper.expected
+  readonly property bool demoMode: status && status.demo === true
+  readonly property bool statusAvailable: statusFresh && (!helper || !helper.installed || helperReady)
   readonly property string pluginDir: cli.replace(/\/[^\/]*$/, "").replace(Quickshell.env("HOME"), "~")
 
   // Why configs, peers and the switches are missing, when they are: the root
@@ -44,16 +49,19 @@ Panel {
     var fix = "Run " + pluginDir + "/install-helper to fix."
     if (!helper) return privileged ? "" : "Configs, peers and connect/disconnect need the root helper. " + fix
     if (!helper.installed) return "Configs, peers and connect/disconnect need the root helper. " + fix
+    if (helper.error) return "Privileged status unavailable: " + String(helper.error)
     if (helper.expected && helper.version !== helper.expected) return "The root helper is out of date. " + fix
-    if (!privileged) return "The root helper isn't answering. " + fix
+    if (!privileged) return "The root helper isn't answering. " + String(helper.error || "") + " " + fix
     return ""
   }
 
-  property var rates: ({})        // name -> {rx, tx} bytes/s; null until two samples exist
-  property var history: ({})      // name -> [{rx, tx}], newest last
-  property var previous: ({})     // name -> {rx, tx, t} from the previous poll
-  property var latency: ({})      // name -> ms, or null when the probe got no reply
-  property var lastStates: ({})   // name -> state at the previous poll, for notifications
+  property var rates: Object.create(null)
+  property var history: Object.create(null)
+  property var previous: Object.create(null)
+  property var latency: Object.create(null)
+  property var latencyErrors: Object.create(null)
+  property var lastStates: Object.create(null)
+  property var lastTunnels: Object.create(null)
 
   property string selectedName: ""
   property string busyTunnel: ""
@@ -69,14 +77,17 @@ Panel {
     for (var j = 0; j < list.length; j++) if (list[j].up) return list[j]
     return list.length ? list[0] : null
   }
-  readonly property string selectedState: Model.state(selected, now)
-  readonly property bool selectedUp: selected !== null && selected.up === true
+  readonly property string selectedState: statusAvailable ? Model.state(selected, now) : "unknown"
+  readonly property bool selectedUp: statusAvailable && selected !== null && selected.up === true
   readonly property bool selectedStale: selectedState === "stale" || selectedState === "connecting"
   readonly property var selectedRates: selected && rates[selected.name] ? rates[selected.name] : null
   readonly property var selectedRoutes: Model.routes(selected)
   readonly property var selectedDns: Model.dnsServers(selected)
   readonly property string selectedProbeHost: Model.probeHost(selected, probeSettings)
-  readonly property var selectedLatency: selected && latency[selected.name] !== undefined ? latency[selected.name] : undefined
+  readonly property var selectedProbeReading: selected ? latency[selected.name] : null
+  readonly property var selectedLatency: selectedProbeReading && selectedProbeReading.host === selectedProbeHost
+    && selectedProbeReading.ifindex === selected.ifindex && now >= selectedProbeReading.time
+    && now - selectedProbeReading.time <= 12 ? selectedProbeReading.ms : undefined
   readonly property var selectedPeer: {
     if (!selected) return null
     if (Array.isArray(selected.peers) && selected.peers.length) return selected.peers[0]
@@ -88,8 +99,8 @@ Panel {
   readonly property var selectedAutostart: selected && selected.config && typeof selected.config.autostart === "boolean"
     ? selected.config.autostart : null
   readonly property bool bootBusy: bootProc.running
-  readonly property bool canDrive: privileged && selected !== null && selected.configured && busyTunnel === ""
-  readonly property string overallState: busyTunnel !== "" ? "busy" : Model.overall(tunnels, now)
+  readonly property bool canDrive: statusAvailable && helperReady && selected !== null && selected.configured && busyTunnel === ""
+  readonly property string overallState: !statusAvailable ? "unknown" : busyTunnel !== "" ? "busy" : Model.overall(tunnels, now)
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -104,22 +115,25 @@ Panel {
     if (!everLoaded) return failed ? "Couldn't read status" : "Loading…"
     // Only the helper can see /etc/wireguard; without it, an empty list says
     // nothing is up, not that nothing is configured.
-    if (!selected) return privileged ? "No tunnels in /etc/wireguard" : "No tunnel is up"
+    if (!statusAvailable) return "Status unavailable — refresh to retry"
+    if (!selected) return privileged ? "No tunnels in /etc/wireguard" : "No interface detected"
     var parts = [busyTunnel === selected.name ? busyLabel : Model.stateLabel(selectedState)]
     var address = Model.primaryAddress(selected)
     if (address) parts.push(address)
     return parts.join("  ·  ")
   }
 
-  readonly property string latencyText: !selectedUp || selectedLatency === undefined ? ""
+  readonly property string latencyText: !selectedUp || selectedProbeHost === "" ? ""
+    : selected && latencyErrors[selected.name] ? "Probe unavailable"
+    : selectedLatency === undefined ? ""
     : selectedLatency === null ? "no reply" : Math.round(selectedLatency) + " ms"
 
   readonly property string tooltipText: !everLoaded
     ? (failed ? "WireGuard — couldn't read status" : "WireGuard — loading…")
-    : Model.tooltip(tunnels, now, labels, rates, privileged)
+    : Model.tooltip(tunnels, now, labels, rates, privileged, statusAvailable, demoMode)
 
   function stateColor(st) {
-    if (st === "stale" || st === "connecting") return urgent
+    if (st === "stale" || st === "connecting" || st === "unknown") return urgent
     if (st === "down" || st === "none") return dim
     return fg
   }
@@ -130,7 +144,7 @@ Panel {
   }
 
   function withKey(obj, key, value) {
-    var next = {}
+    var next = Object.create(null)
     for (var k in obj) next[k] = obj[k]
     next[key] = value
     return next
@@ -167,14 +181,20 @@ Panel {
 
   // ---- Reading ------------------------------------------------------------
   function refresh() {
-    if (statusProc.running) return
-    statusProc.command = ["bash", wg.cli, "json"]
+    if (statusProc.running || statusProc.collecting) return
+    statusProc.collecting = true
+    statusProc.outputReady = false
+    statusProc.exitReady = false
+    statusProc.expired = false
+    statusProc.output = ""
+    statusProc.command = ["bash", "-c", 'set -o pipefail; timeout -k 2 15 bash "$0" json | head -c 131073', wg.cli]
+    statusWatchdog.restart()
     statusProc.running = true
   }
 
   function ingest(parsed) {
     var t = Date.now() / 1000
-    var nextRates = {}, nextPrevious = {}, nextHistory = {}
+    var nextRates = Object.create(null), nextPrevious = Object.create(null), nextHistory = Object.create(null)
     for (var i = 0; i < parsed.tunnels.length; i++) {
       var tn = parsed.tunnels[i]
       if (!tn.up) continue
@@ -182,16 +202,17 @@ Panel {
       var h = (history[tn.name] || []).slice()
       // Counters restart from zero when wg-quick re-creates the interface;
       // start the graph over instead of plotting a huge negative rate.
-      if (p && (tn.rx < p.rx || tn.tx < p.tx)) { p = null; h = [] }
+      if (p && (tn.rx < p.rx || tn.tx < p.tx || p.ifindex !== tn.ifindex
+          || t <= p.t || t - p.t > Math.max(15, refreshSeconds * 3))) { p = null; h = [] }
       if (p && t > p.t) {
         var r = { rx: (tn.rx - p.rx) / (t - p.t), tx: (tn.tx - p.tx) / (t - p.t) }
         nextRates[tn.name] = r
         h.push(r)
         while (h.length > historyLength) h.shift()
       } else {
-        nextRates[tn.name] = rates[tn.name] || null
+        nextRates[tn.name] = null
       }
-      nextPrevious[tn.name] = { rx: tn.rx, tx: tn.tx, t: t }
+      nextPrevious[tn.name] = { rx: tn.rx, tx: tn.tx, t: t, ifindex: tn.ifindex }
       nextHistory[tn.name] = h
     }
     rates = nextRates
@@ -199,45 +220,85 @@ Panel {
     history = nextHistory
     announce(parsed)
     status = parsed
+    now = t
+    lastSuccess = t
     everLoaded = true
     failed = false
   }
 
   function announce(parsed) {
-    var next = {}
+    var next = Object.create(null), nextTunnels = Object.create(null)
     for (var i = 0; i < parsed.tunnels.length; i++) {
       var tn = parsed.tunnels[i]
       var st = Model.state(tn, parsed.now)
       next[tn.name] = st
+      nextTunnels[tn.name] = tn
       var before = lastStates[tn.name]
       if (!everLoaded || before === undefined || before === st) continue
       // Changes made through the helper (this widget on any monitor, or
       // omarchy-wireguard from a terminal) report themselves; notifications
-      // are for what happens on its own. drivenAt is the helper's clock, as
+      // are for what happens on its own. drivenAt is the backend's clock, as
       // is parsed.now.
       if (tn.drivenAt && parsed.now - tn.drivenAt < 20) continue
       if (!notifyChanges) continue
       var name = Model.label(tn, labels)
-      if (st === "stale") notify(tn.name, st, name + " — no handshake", "The peer hasn't answered for over 3 minutes.")
+      if (st === "stale") notify(tn.name, st, name + " — handshake warning", "No recent handshake while keepalives are configured.")
       else if (st === "connected" && before === "stale") notify(tn.name, st, name + " — reconnected", "Handshakes are flowing again.")
       else if (st === "connected") notify(tn.name, st, name + " — connected", Model.primaryAddress(tn))
       else if (st === "down") notify(tn.name, st, name + " — disconnected", "The tunnel went down.")
     }
+    for (var gone in lastStates) {
+      if (next[gone] !== undefined || lastStates[gone] === "down" || !notifyChanges || !everLoaded) continue
+      var prior = lastTunnels[gone] || { name: gone }
+      var removed = parsed.now - Number(prior.drivenAt || 0) < 20
+      if (!removed) notify(gone, "down", Model.label(prior, labels) + " — disconnected", "The WireGuard interface disappeared.")
+    }
     lastStates = next
+    lastTunnels = nextTunnels
   }
 
   Process {
     id: statusProc
+    property bool collecting: false
+    property bool outputReady: false
+    property bool exitReady: false
+    property bool expired: false
+    property int code: -1
+    property string output: ""
+    function finish() {
+      if (!outputReady || !exitReady) return
+      collecting = false
+      statusWatchdog.stop()
+      var parsed = code === 0 && !expired ? Model.parse(output) : null
+      if (parsed) wg.ingest(parsed)
+      else wg.failed = true
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var parsed = Model.parse(text)
-        if (parsed) wg.ingest(parsed)
-        else wg.failed = true
+        statusProc.output = text
+        statusProc.outputReady = true
+        statusProc.finish()
       }
     }
-    onExited: function(exitCode) { if (exitCode !== 0) wg.failed = true }
+    onExited: function(exitCode) {
+      code = exitCode
+      exitReady = true
+      finish()
+    }
   }
+
+  Timer {
+    id: statusWatchdog
+    interval: 18000
+    onTriggered: {
+      wg.failed = true
+      statusProc.expired = true
+      if (statusProc.running) statusProc.signal(15)
+      else statusProc.collecting = false
+    }
+  }
+  Timer { interval: 1000; running: true; repeat: true; onTriggered: wg.now = Date.now() / 1000 }
 
   // Poll faster while the panel is open — the rates and the graph are live
   // there; the closed bar icon only needs to notice state changes.
@@ -253,22 +314,41 @@ Panel {
   function probe() {
     if (probeProc.running || !selectedUp || selectedProbeHost === "") return
     probeProc.tunnelName = selected.name
-    probeProc.command = ["bash", wg.cli, "probe", selectedProbeHost, selected.name]
+    probeProc.host = selectedProbeHost
+    probeProc.interfaceIndex = selected.ifindex || 0
+    probeProc.command = ["timeout", "-k", "1", "16", "bash", wg.cli, "probe", selectedProbeHost, selected.name]
+    probeWatchdog.restart()
     probeProc.running = true
   }
 
   Process {
     id: probeProc
     property string tunnelName: ""
+    property string host: ""
+    property int interfaceIndex: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var result = null
         try { result = JSON.parse(String(text || "").trim()) } catch (e) {}
-        if (result && result.host !== undefined) wg.latency = wg.withKey(wg.latency, probeProc.tunnelName, result.ms)
+        if (!wg.selectedUp || wg.selected.name !== probeProc.tunnelName
+            || (wg.selected.ifindex || 0) !== probeProc.interfaceIndex || wg.selectedProbeHost !== probeProc.host) return
+        if (result && result.ok !== false && result.host === probeProc.host) {
+          wg.latency = wg.withKey(wg.latency, probeProc.tunnelName,
+            {ms: result.ms, host: probeProc.host, ifindex: wg.selected.ifindex, time: Date.now() / 1000})
+          wg.latencyErrors = wg.withKey(wg.latencyErrors, probeProc.tunnelName, "")
+        } else wg.latencyErrors = wg.withKey(wg.latencyErrors, probeProc.tunnelName, result ? result.error : "Probe failed")
       }
     }
+    onExited: function(exitCode) {
+      probeWatchdog.stop()
+      if (exitCode !== 0 && wg.selectedUp && wg.selected.name === tunnelName
+          && (wg.selected.ifindex || 0) === interfaceIndex && wg.selectedProbeHost === host)
+        wg.latencyErrors = wg.withKey(wg.latencyErrors, tunnelName, "Probe failed or timed out")
+    }
   }
+
+  Timer { id: probeWatchdog; interval: 18000; onTriggered: if (probeProc.running) probeProc.signal(15) }
 
   Timer {
     interval: 4000
@@ -280,7 +360,7 @@ Panel {
 
   // ---- Driving ------------------------------------------------------------
   function drive(verb, tunnel) {
-    if (!tunnel || !tunnel.configured || !privileged || driveProc.running) return
+    if (!statusAvailable || !helperReady || !tunnel || !tunnel.configured || driveProc.running) return
     busyTunnel = tunnel.name
     busyVerb = verb
     message = ""
@@ -329,7 +409,7 @@ Panel {
   // Enables or disables wg-quick@NAME.service. The tunnel stays up or down as
   // it is; that is the power switch's job.
   function setAutostart(tunnel, on) {
-    if (!tunnel || !tunnel.configured || !privileged || bootProc.running) return
+    if (!statusAvailable || !helperReady || !tunnel || !tunnel.configured || bootProc.running) return
     bootProc.autostart = on
     bootProc.tunnelName = tunnel.name
     bootProc.command = ["bash", wg.cli, on ? "enable" : "disable", tunnel.name]
@@ -387,7 +467,7 @@ Panel {
     anchors.fill: parent
     bar: wg.bar
     text: wg.overallState === "busy" ? Model.ICON_BUSY : Model.icon(wg.overallState)
-    active: wg.overallState === "stale" || wg.overallState === "connecting"
+    active: wg.overallState === "stale" || wg.overallState === "connecting" || wg.overallState === "unknown"
     dimmed: wg.overallState === "down" || wg.overallState === "none"
     tooltipText: wg.opened ? "" : wg.tooltipText
     onPressed: function(b) {
@@ -474,6 +554,17 @@ Panel {
                 }
               }
             }
+          }
+
+          Text {
+            visible: wg.demoMode
+            width: parent.width
+            text: "DEMO MODE — simulated tunnel data"
+            textFormat: Text.PlainText
+            color: wg.urgent
+            font.family: wg.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
           }
 
           Text {
@@ -649,7 +740,7 @@ Panel {
             InfoRow {
               visible: wg.selectedUp && wg.selected && Array.isArray(wg.selected.peers)
               icon: Model.ICON_CLOCK
-              label: "Handshake"
+              label: "Latest HS"
               value: Model.handshakeText(wg.selected, wg.now)
               valueColor: wg.selectedStale ? wg.urgent : wg.fg
             }
@@ -699,7 +790,7 @@ Panel {
               label: "Start at boot"
               checked: wg.selectedAutostart === true
               busy: wg.bootBusy
-              interactive: wg.privileged
+              interactive: wg.statusAvailable && wg.helperReady
               hint: wg.selected ? (wg.selectedAutostart ? "Disable" : "Enable") + " wg-quick@" + wg.selected.name + ".service" : ""
               onToggled: wg.setAutostart(wg.selected, wg.selectedAutostart !== true)
             }
@@ -989,7 +1080,7 @@ Panel {
   component TunnelRow: Item {
     id: tunnelRow
     property var tunnel: null
-    readonly property string st: Model.state(tunnel, wg.now)
+    readonly property string st: wg.statusAvailable ? Model.state(tunnel, wg.now) : "unknown"
     readonly property bool isSelected: wg.selected !== null && tunnel !== null && wg.selected.name === tunnel.name
 
     implicitHeight: Math.max(rowLabels.implicitHeight, rowSwitch.implicitHeight) + Style.space(10)
@@ -1045,7 +1136,7 @@ Panel {
         width: parent.width
         text: Model.stateLabel(tunnelRow.st)
           + (Model.primaryAddress(tunnelRow.tunnel) ? "  ·  " + Model.primaryAddress(tunnelRow.tunnel) : "")
-          + (tunnelRow.tunnel && !tunnelRow.tunnel.configured ? "  ·  not managed by wg-quick" : "")
+          + (tunnelRow.tunnel && !tunnelRow.tunnel.configured ? (wg.privileged ? "  ·  not managed by wg-quick" : "  ·  config unavailable") : "")
         textFormat: Text.PlainText
         color: wg.dim
         font.family: wg.fontFamily
@@ -1061,7 +1152,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       checked: tunnelRow.tunnel !== null && tunnelRow.tunnel.up === true
       busy: tunnelRow.tunnel !== null && wg.busyTunnel === tunnelRow.tunnel.name
-      interactive: wg.privileged && tunnelRow.tunnel !== null && tunnelRow.tunnel.configured && wg.busyTunnel === ""
+      interactive: wg.statusAvailable && wg.helperReady && tunnelRow.tunnel !== null && tunnelRow.tunnel.configured && wg.busyTunnel === ""
       foreground: wg.fg
       onToggled: wg.toggleTunnel(tunnelRow.tunnel)
     }
