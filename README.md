@@ -9,9 +9,9 @@ connect or disconnect.
 
 ![The WireGuard panel](preview.png)
 
-- **Bar icon** — a shield: normal when connected, in the urgent colour when a
-  tunnel is up but the peer has stopped handshaking, dimmed when nothing is
-  up. Hovering shows each tunnel's state, address and live rates.
+- **Bar icon** — a shield: green for recent peer handshakes, red for detected
+  problems, orange for uncertain status, blue during tunnel actions and gray
+  when disconnected. Hovering shows each tunnel's state, address and live rates.
 - **Panel**
   - tunnel name, state, address and round-trip latency, with an on/off switch
   - live download/upload rates, a two-minute traffic graph and totals
@@ -36,6 +36,20 @@ handshake with keepalive configured produces a warning; its threshold is the
 greater of three minutes and twice the keepalive interval plus two minutes.
 A recent handshake from one peer cannot hide a warning from another. Latency
 probes and traffic provide additional evidence, not a guarantee of connectivity.
+
+| Badge color | Meaning |
+|---|---|
+| Green | All peers on active tunnels have recent handshakes. |
+| Red | A peer with keepalive configured has stale handshakes, or an installed root helper has a permission, version or collection problem. |
+| Orange | Waiting for a handshake, idle or partially active peers, unavailable readings, or peer information missing without the helper. Demo mode also uses orange. |
+| Blue | Connecting, disconnecting or reconnecting through the widget. |
+| Gray | No tunnel is up, or no tunnels are configured. |
+
+The panel uses the same status colors. With multiple tunnels, red takes priority
+over orange, and orange over green; configured tunnels that are down do not
+downgrade an active tunnel's status. Idle tunnels use orange because their old
+handshake provides limited evidence of current connectivity, even during normal
+inactivity.
 
 This fork retains the original widget's controls and monitoring features and
 hardens its privileged helper, installer, state files and network probes.

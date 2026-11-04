@@ -73,13 +73,15 @@ function state(tunnel, now) {
   if (!tunnel || !tunnel.up) return "down"
   if (!isList(tunnel.peers)) return "up"
   if (!tunnel.peers.length) return "connecting"
-  var recent = 0, waiting = false
+  var recent = 0, waiting = false, unavailable = false
   for (var i = 0; i < tunnel.peers.length; i++) {
     var value = peerState(tunnel.peers[i], now)
-    if (value === "stale" || value === "unknown") return value
+    if (value === "stale") return value
+    if (value === "unknown") unavailable = true
     if (value === "connected") recent++
     if (value === "connecting") waiting = true
   }
+  if (unavailable) return "unknown"
   if (recent === tunnel.peers.length) return "connected"
   if (recent > 0) return "partial"
   return waiting ? "connecting" : "idle"
@@ -104,15 +106,13 @@ function stateLabel(st) {
   }[st] || st
 }
 
-// The bar shows one icon for every tunnel: healthy if any is connected,
-// warning if one is up but not passing traffic, off when none is up.
+// Show the most serious state across active tunnels. An uncertain tunnel must
+// not look healthy because another is connected, and stale peers take priority.
 function overall(tunnels, now) {
   var best = "none"
-  var rank = { none: 0, down: 1, stale: 2, connecting: 2, idle: 3, partial: 3, up: 3, connected: 4 }
+  var rank = { none: 0, down: 1, connected: 2, up: 3, idle: 3, partial: 3, connecting: 3, unknown: 3, stale: 4 }
   for (var i = 0; i < (tunnels || []).length; i++) {
     var st = state(tunnels[i], now)
-    // A stale tunnel outranks a connected one: something needs attention.
-    if (st === "stale" || st === "connecting" || st === "unknown") return st
     if (rank[st] > rank[best]) best = st
   }
   return best

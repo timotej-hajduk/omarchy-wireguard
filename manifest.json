@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omarchy-wireguard",
   "name": "WireGuard",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Shane Poppleton",
   "description": "WireGuard tunnel status, live traffic, latency and connect/disconnect",
   "kinds": [

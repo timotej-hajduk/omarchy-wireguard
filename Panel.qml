@@ -37,6 +37,7 @@ Panel {
   readonly property bool privileged: status ? status.privileged === true : false
   readonly property var helper: status && status.helper ? status.helper : null
   readonly property bool helperReady: privileged && helper && helper.version === helper.expected
+  readonly property bool helperProblem: everLoaded && helper !== null && helper.installed && !helperReady
   readonly property bool demoMode: status && status.demo === true
   readonly property bool statusAvailable: statusFresh && (!helper || !helper.installed || helperReady)
   readonly property string pluginDir: cli.replace(/\/[^\/]*$/, "").replace(Quickshell.env("HOME"), "~")
@@ -106,6 +107,12 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color accent: Color.accent
   readonly property color dim: Qt.darker(fg, 1.55)
+  readonly property color healthyColor: "#4ade80"
+  readonly property color problemColor: "#f87171"
+  readonly property color uncertainColor: "#fb923c"
+  readonly property color busyColor: "#60a5fa"
+  readonly property color inactiveColor: "#9ca3af"
+  readonly property color badgeColor: demoMode ? uncertainColor : stateColor(overallState)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property string busyLabel: busyVerb === "up" ? "Connecting…"
@@ -133,9 +140,11 @@ Panel {
     : Model.tooltip(tunnels, now, labels, rates, privileged, statusAvailable, demoMode)
 
   function stateColor(st) {
-    if (st === "stale" || st === "connecting" || st === "unknown") return urgent
-    if (st === "down" || st === "none") return dim
-    return fg
+    if (st === "stale" || (st === "unknown" && helperProblem)) return problemColor
+    if (st === "connected") return healthyColor
+    if (st === "busy") return busyColor
+    if (st === "down" || st === "none") return inactiveColor
+    return uncertainColor
   }
 
   function tunnelNamed(name) {
@@ -460,14 +469,14 @@ Panel {
   }
 
   // ---- Bar ----------------------------------------------------------------
-  // Normal when connected, urgent when a tunnel is up but not handshaking,
-  // dimmed when nothing is up.
+  // Match the panel's status colors without the bar theme overriding them.
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: wg.bar
     text: wg.overallState === "busy" ? Model.ICON_BUSY : Model.icon(wg.overallState)
-    active: wg.overallState === "stale" || wg.overallState === "connecting" || wg.overallState === "unknown"
+    foreground: wg.badgeColor
+    useActiveColor: false
     dimmed: wg.overallState === "down" || wg.overallState === "none"
     tooltipText: wg.opened ? "" : wg.tooltipText
     onPressed: function(b) {
@@ -531,7 +540,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 text: wg.selected && wg.busyTunnel === wg.selected.name ? Model.ICON_BUSY : Model.icon(wg.selectedState)
-                color: wg.stateColor(wg.selectedState)
+                color: wg.stateColor(wg.selected && wg.busyTunnel === wg.selected.name ? "busy" : wg.selectedState)
                 font.family: wg.fontFamily
                 font.pixelSize: Style.font.display
               }
@@ -561,7 +570,7 @@ Panel {
             width: parent.width
             text: "DEMO MODE — simulated tunnel data"
             textFormat: Text.PlainText
-            color: wg.urgent
+            color: wg.uncertainColor
             font.family: wg.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -1108,7 +1117,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       text: tunnelRow.tunnel && wg.busyTunnel === tunnelRow.tunnel.name ? Model.ICON_BUSY : Model.icon(tunnelRow.st)
       textFormat: Text.PlainText
-      color: wg.stateColor(tunnelRow.st)
+      color: wg.stateColor(tunnelRow.tunnel && wg.busyTunnel === tunnelRow.tunnel.name ? "busy" : tunnelRow.st)
       font.family: wg.fontFamily
       font.pixelSize: Style.font.heading
     }

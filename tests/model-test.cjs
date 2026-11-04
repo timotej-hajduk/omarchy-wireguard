@@ -16,6 +16,20 @@ assert.equal(model.state({up:true, peers:[idle]}, now), 'idle');
 assert.equal(model.state({up:true, peers:[current, idle]}, now), 'partial');
 assert.equal(model.state({up:true, peers:[current, stale]}, now), 'stale');
 assert.equal(model.state({up:true, peers:[{handshake:now-190,keepalive:300}]}, now), 'idle');
+const unknown = {handshake:now+60,keepalive:25};
+assert.equal(model.state({up:true,peers:[unknown,stale]},now),'stale');
+assert.equal(model.state({up:true,peers:[stale,unknown]},now),'stale');
+const healthyTunnel = {up:true,peers:[current]};
+const idleTunnel = {up:true,peers:[idle]};
+const waitingTunnel = {up:true,peers:[]};
+const staleTunnel = {up:true,peers:[stale]};
+for (const uncertain of [idleTunnel,waitingTunnel,{up:true,peers:null},{up:true,peers:[unknown]}]) {
+  assert.notEqual(model.overall([healthyTunnel,uncertain],now),'connected');
+  assert.notEqual(model.overall([uncertain,healthyTunnel],now),'connected');
+  assert.equal(model.overall([uncertain,staleTunnel],now),'stale');
+  assert.equal(model.overall([staleTunnel,uncertain],now),'stale');
+}
+assert.equal(model.overall([healthyTunnel,{up:false}],now),'connected');
 assert.equal(model.fresh(true,false,1000,1005,5), true);
 assert.equal(model.fresh(true,true,1000,1005,5), false);
 assert.equal(model.fresh(true,false,1000,1020,5), false);
