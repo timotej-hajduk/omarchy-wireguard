@@ -1,5 +1,5 @@
 #!/bin/bash
-# omarchy-wireguard-root: the only part of the io.github.codemonkey76.wireguard
+# omarchy-wireguard-root: the only part of the omarchy-wireguard
 # Omarchy widget that runs as root.
 #
 # install-helper copies it, root-owned, to /usr/local/libexec/omarchy-wireguard/

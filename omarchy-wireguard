@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WireGuard helper for the io.github.codemonkey76.wireguard Omarchy widget.
+# WireGuard helper for the omarchy-wireguard Omarchy widget.
 #
 #   omarchy-wireguard [json]                     every tunnel's state, as JSON
 #   omarchy-wireguard up|down|restart NAME       drive a wg-quick tunnel

@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: wg
-  moduleName: "io.github.codemonkey76.wireguard"
-  ipcTarget: "io.github.codemonkey76.wireguard"
+  moduleName: "omarchy-wireguard"
+  ipcTarget: "omarchy-wireguard"
   manageIpc: false
 
   // ---- Configuration ------------------------------------------------------
@@ -446,7 +446,7 @@ Panel {
   implicitHeight: button.implicitHeight
 
   IpcHandler {
-    target: "io.github.codemonkey76.wireguard"
+    target: "omarchy-wireguard"
 
     function open(): void { wg.open() }
     function close(): void { wg.close() }

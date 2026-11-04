@@ -131,7 +131,7 @@ chown root:root "$helper_stage/helper"
 chmod 0755 "$helper_stage/helper"
 
 cat >"$rule_stage/rule" <<EOF
-# Installed by the io.github.codemonkey76.wireguard Omarchy widget (install-helper).
+# Installed by the omarchy-wireguard Omarchy widget (install-helper).
 # Lets $user run the widget'\''s root helper, and nothing else, without a password.
 # Suppress polling noise only; successful control operations remain auditable.
 Cmnd_Alias OMARCHY_WIREGUARD_READ = $dest status, $dest version

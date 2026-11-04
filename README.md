@@ -59,21 +59,21 @@ The original plugin is by [Shane Poppleton](https://github.com/codemonkey76/omar
 
 ```bash
 omarchy plugin add https://github.com/timotej-hajduk/omarchy-wireguard --enable
-~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper
+~/.config/omarchy/plugins/omarchy-wireguard/install-helper
 ```
 
 Or by hand:
 
 ```bash
 git clone https://github.com/timotej-hajduk/omarchy-wireguard \
-  ~/.config/omarchy/plugins/io.github.codemonkey76.wireguard
-omarchy plugin enable io.github.codemonkey76.wireguard
-~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper
+  ~/.config/omarchy/plugins/omarchy-wireguard
+omarchy plugin enable omarchy-wireguard
+~/.config/omarchy/plugins/omarchy-wireguard/install-helper
 ```
 
 Either way the widget lands in the bar's right section: `--enable` and
 `omarchy plugin enable` both place it. Move it later with
-`omarchy bar move io.github.codemonkey76.wireguard --section left`.
+`omarchy bar move omarchy-wireguard --section left`.
 
 `install-helper` asks for your sudo password once. Re-run it after updating
 the plugin if the panel says the helper is out of date.
@@ -161,7 +161,7 @@ Set these on the widget's entry in `~/.config/omarchy/shell.json`:
 
 ```json
 {
-  "id": "io.github.codemonkey76.wireguard",
+  "id": "omarchy-wireguard",
   "refreshSeconds": 5,
   "notify": true,
   "labels": { "wg0": "Work" },
@@ -203,12 +203,12 @@ Click a tunnel in the list to show it in the header.
 ### From scripts and keybindings
 
 ```bash
-omarchy-shell io.github.codemonkey76.wireguard toggle        # open/close the panel
-omarchy-shell io.github.codemonkey76.wireguard toggleTunnel  # connect/disconnect
-omarchy-shell io.github.codemonkey76.wireguard up wg0
-omarchy-shell io.github.codemonkey76.wireguard down wg0
-omarchy-shell io.github.codemonkey76.wireguard restart wg0
-omarchy-shell io.github.codemonkey76.wireguard status
+omarchy-shell omarchy-wireguard toggle        # open/close the panel
+omarchy-shell omarchy-wireguard toggleTunnel  # connect/disconnect
+omarchy-shell omarchy-wireguard up wg0
+omarchy-shell omarchy-wireguard down wg0
+omarchy-shell omarchy-wireguard restart wg0
+omarchy-shell omarchy-wireguard status
 ```
 
 The bundled `omarchy-wireguard` script works on its own too:
@@ -282,8 +282,8 @@ Node is only needed for the tests. Qt 6 `qmllint` can additionally validate
 ## Remove
 
 ```bash
-~/.config/omarchy/plugins/io.github.codemonkey76.wireguard/install-helper --remove
-omarchy plugin remove io.github.codemonkey76.wireguard
+~/.config/omarchy/plugins/omarchy-wireguard/install-helper --remove
+omarchy plugin remove omarchy-wireguard
 ```
 
 The first command removes the root helper and its sudoers rule, the second the
